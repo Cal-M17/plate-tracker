@@ -1,11 +1,6 @@
-// ==========================================
-// PLATE TRACKER - MAIN APPLICATION LOGIC
-// ==========================================
-
-// Helper selectors & utilities
-const $ = (sel) => document.querySelector(sel);
-const r = (num, decimals = 1) => Number(num.toFixed(decimals));
-const uid = () => '_' + Math.random().toString(36).substr(2, 9);
+import { $, r, r1, esc, getTodayDate, uid } from './utils.js';
+import { fetchAllProfiles, fetchProfileData, dbSaveFood, dbDeleteFood, dbSaveRecipe, dbDeleteRecipe, dbAddLog, dbDeleteLog, dbSaveWeight, dbDeleteWeight } from './api.js';
+import { queryAIParser } from './ai.js';
 
 // UK Starter Foods Dataset for Auto-Seeding
 const UK_STARTER_FOODS = [
@@ -32,206 +27,111 @@ const UK_STARTER_FOODS = [
     { name: "Chickpeas, canned", k: 115, p: 7.2, c: 16, f: 2.9, sg: 120 }
 ];
 
-// Application Global State
-let S = {
-    cur: localStorage.getItem('plate_cur_profile') || 'default',
-    foods: [],
-    recipes: [],
-    log: [],
-    weights: [],
-    pendingLog: null // Holds AI parsed food preview before user confirmation
-};
+let S = { profiles: [], cur: null, foods: [], recipes: [], log: [], weights: [], target: 2000, pendingLog: null };
+let tab = "today", date = getTodayDate(), add = { id: "", mode: "s", amt: "1", meal: "Breakfast", alt: false, amt2: "1" };
+let draft = { name: "", ings: [{ fid: "", g: "" }], cooked: "", servings: "" };
+let chatMessages = [{ sender: 'ai', text: "Alright! Tell me what you've eaten today, and I'll track it down for you." }];
+const M = ["k", "p", "c", "f"], MEALS = ["Breakfast", "Lunch", "Dinner", "Snacks"];
 
-let chatMessages = [
-    { sender: 'ai', text: "Alright! Tell me what you've eaten today, and I'll track it down for you." }
-];
-
-let date = new Date().toISOString().split('T')[0];
-
-// ==========================================
-// DATA LOADING & AUTO-SEEDING
-// ==========================================
-async function loadCurrentProfileData() {
-    try {
-        const data = await fetchProfileData(S.cur);
-        S.recipes = data.recipes || [];
-        S.log = data.log || [];
-        S.weights = data.weights || [];
-
-        // Auto-seed UK starter foods if profile food database is empty
-        if (!data.foods || data.foods.length === 0) {
-            console.log("Seeding UK starter foods into Supabase...");
-            for (const f of UK_STARTER_FOODS) {
-                const foodPayload = {
-                    id: uid(),
-                    name: f.name,
-                    k: f.k,
-                    p: f.p,
-                    c: f.c,
-                    f: f.f,
-                    sg: f.sg
-                };
-                const saved = await dbSaveFood(foodPayload, S.cur);
-                if (saved) data.foods.push(saved);
-            }
-        }
-        
-        S.foods = data.foods || [];
-        render();
-    } catch (err) {
-        console.error("Error loading profile data:", err);
-    }
-}
-
-function itemsList() {
-    return S.foods;
-}
-
-// ==========================================
-// AI PARSER CALL WRAPPER
-// ==========================================
-async function queryAIParser(message, availableFoods) {
-    try {
-        const res = await fetch('/api/parse-food', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message, availableFoods })
-        });
-        if (!res.ok) throw new Error('AI Serverless endpoint error');
-        return await res.json();
-    } catch (err) {
-        console.error("AI Parser fetch error:", err);
-        return null;
-    }
-}
-
-// ==========================================
-// CHAT & CONFIRMATION WORKFLOW
-// ==========================================
-window.submitChat = async () => {
-    const input = $("#chat-input");
-    const text = input.value.trim();
-    if (!text) return;
-
-    chatMessages.push({ sender: 'user', text });
-    input.value = "";
-    render();
-    const box = $("#chat-box");
-    if (box) box.scrollTop = box.scrollHeight;
-
-    const lowerText = text.toLowerCase();
-
-    // 1. Check if user is confirming a pending log
-    if (S.pendingLog && (lowerText === 'yes' || lowerText === 'y' || lowerText === 'confirm' || lowerText.includes('do it') || lowerText.includes('please'))) {
-        let loggedSummary = [];
-
-        for (const entry of S.pendingLog.items) {
-            let foodItem = null;
-
-            if (entry.id) {
-                foodItem = itemsList().find(i => i.id === entry.id);
-            } else if (entry.newFoodData) {
-                const newFoodPayload = {
-                    id: uid(),
-                    name: entry.newFoodData.name,
-                    k: entry.newFoodData.k,
-                    p: entry.newFoodData.p,
-                    c: entry.newFoodData.c,
-                    f: entry.newFoodData.f,
-                    fi: entry.newFoodData.fi || null,
-                    su: entry.newFoodData.su || null,
-                    sa: entry.newFoodData.sa || null,
-                    sl: entry.newFoodData.sl || null,
-                    sg: entry.newFoodData.sg || 100
-                };
-                
-                const savedFood = await dbSaveFood(newFoodPayload, S.cur);
-                if (savedFood) {
-                    S.foods.push(savedFood);
-                    foodItem = {
-                        id: savedFood.id,
-                        name: savedFood.name,
-                        per: { k: savedFood.k, p: savedFood.p, c: savedFood.c, f: savedFood.f }
-                    };
-                }
-            }
-
-            if (!foodItem) continue;
-
-            const grams = entry.grams || 100;
-            const logItem = {
-                id: uid(),
-                date,
-                meal: S.pendingLog.meal,
-                name: foodItem.name,
-                label: `${r(grams)}g`,
-                k: (foodItem.per?.k || foodItem.k) * grams / 100,
-                p: (foodItem.per?.p || foodItem.p) * grams / 100,
-                c: (foodItem.per?.c || foodItem.c) * grams / 100,
-                f: (foodItem.per?.f || foodItem.f) * grams / 100
-            };
-
-            await dbAddLog(logItem, S.cur);
-            S.log.push(logItem);
-            loggedSummary.push(`${r(grams)}g ${foodItem.name}`);
-        }
-
-        chatMessages.push({ sender: 'ai', text: `Locked in! Successfully logged: ${loggedSummary.join(", ")}. Keep smashing it!` });
-        S.pendingLog = null;
-        render();
-        if (box) box.scrollTop = box.scrollHeight;
-        return;
-    }
-
-    // 2. Check if user is canceling a pending log
-    if (S.pendingLog && (lowerText === 'no' || lowerText === 'cancel' || lowerText === 'n')) {
-        chatMessages.push({ sender: 'ai', text: "No worries, scrapped that log. What did you actually have?" });
-        S.pendingLog = null;
-        render();
-        if (box) box.scrollTop = box.scrollHeight;
-        return;
-    }
-
-    // 3. Query AI parser for new message / food log / chat
-    const aiRes = await queryAIParser(text, S.foods);
-    
-    if (!aiRes) {
-        chatMessages.push({ sender: 'ai', text: "Blimey, my connection dropped. Try that again?" });
-    } else if (aiRes.is_chat) {
-        chatMessages.push({ sender: 'ai', text: aiRes.reply });
-    } else if (!aiRes.items || !aiRes.items.length) {
-        chatMessages.push({ sender: 'ai', text: "I couldn't quite figure out what food that was. Try being a bit more descriptive!" });
+async function init() {
+    const profiles = await fetchAllProfiles();
+    if (!profiles.length) {
+        // Fallback default profile creation if database is empty
+        S.profiles = [{ id: "a", name: "Me", target: 2000 }, { id: "b", name: "Partner", target: 2000 }];
+        S.cur = "a";
     } else {
-        // Store in pending state to await user confirmation
-        S.pendingLog = {
-            meal: aiRes.meal || "Snacks",
-            items: aiRes.items
-        };
-
-        const previewMsg = aiRes.reply || "Here's what I found:";
-        chatMessages.push({ sender: 'ai', text: `${previewMsg}\n\n👉 Reply **'yes'** to confirm and log this, or **'no'** to cancel.` });
+        S.profiles = profiles;
+        S.cur = profiles[0].id;
     }
-    
-    render();
-    if (box) box.scrollTop = box.scrollHeight;
-};
-
-// ==========================================
-// RENDER FUNCTION PLACEHOLDER
-// ==========================================
-function render() {
-    // Renders UI elements (chat boxes, nutrition summaries, tab views)
-    const chatBox = $("#chat-box");
-    if (chatBox) {
-        chatBox.innerHTML = chatMessages.map(m => `
-            <div class="chat-msg ${m.sender}">
-                <span class="bubble">${m.text.replace(/\n/g, '<br>')}</span>
-            </div>
-        `).join('');
-    }
+    await loadCurrentProfileData();
 }
 
-// Initial boot
-document.addEventListener("DOMContentLoaded", () => {
-    loadCurrentProfileData();
-});
+async function loadCurrentProfileData() {
+    const data = await fetchProfileData(S.cur);
+    S.recipes = data.recipes || [];
+    S.log = data.log || [];
+    S.weights = data.weights || [];
+
+    // Auto-seed UK starter foods if profile food database is empty
+    if (!data.foods || data.foods.length === 0) {
+        console.log("Seeding UK starter foods into Supabase...");
+        data.foods = [];
+        for (const f of UK_STARTER_FOODS) {
+            const foodPayload = {
+                id: uid(),
+                name: f.name,
+                k: f.k,
+                p: f.p,
+                c: f.c,
+                f: f.f,
+                sg: f.sg
+            };
+            const saved = await dbSaveFood(foodPayload, S.cur);
+            if (saved) data.foods.push(saved);
+        }
+    }
+    
+    S.foods = data.foods || [];
+    render();
+}
+
+// Compute macros per items
+function itemsList() {
+    const a = S.foods.map(f => ({ id: f.id, name: f.name, t: "Foods", per: { k: f.k, p: f.p, c: f.c, f: f.f }, sg: f.sg || 100 }));
+    S.recipes.forEach(x => {
+        const t = computeRecipe(x), w = +x.cooked || t.w;
+        if (!w) return;
+        const per = {};
+        M.forEach(m => per[m] = t[m] / w * 100);
+        a.push({ id: x.id, name: x.name, t: "Recipes", per, sg: w / (+x.servings || 1) });
+    });
+    return a.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function computeRecipe(x) {
+    const t = { k: 0, p: 0, c: 0, f: 0, w: 0 };
+    x.ings.forEach(i => {
+        const f = S.foods.find(a => a.id === i.fid), g = +i.g || 0;
+        if (!f || !g) return;
+        t.w += g;
+        M.forEach(m => t[m] += f[m] * g / 100);
+    });
+    return t;
+}
+
+function render() {
+    const profSwitcher = $("#profile-switcher");
+    if (profSwitcher) {
+        profSwitcher.innerHTML = S.profiles.map(p => `<button class="\${p.id === S.cur ? "" : "alt"}" onclick="switchProfile('${p.id}')">${esc(p.name)}</button>`).join("");
+    }
+    
+    const app = $("#app");
+    if (app) {
+        if (tab === "today") app.innerHTML = renderToday();
+        else if (tab === "chat") app.innerHTML = renderAIChat();
+        else if (tab === "foods") app.innerHTML = renderFoods();
+        else if (tab === "rec") app.innerHTML = renderRecipes();
+        else if (tab === "more") app.innerHTML = renderSettings();
+    }
+
+    document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.t === tab));
+}
+
+window.switchProfile = async (id) => {
+    S.cur = id;
+    await loadCurrentProfileData();
+};
+
+// --- Views ---
+function renderToday() {
+    const L = S.log.filter(l => l.date === date), T = { k: 0, p: 0, c: 0, f: 0 };
+    L.forEach(l => M.forEach(m => T[m] += l[m]));
+
+    return `<h2>Today’s Log</h2>
+    <div class="card">
+      <div style="display:flex;gap:6px">
+        <input type="date" value="\${date}" onchange="window.setDate(this.value)">
+        <button class="alt" onclick="window.goToday()">Today</button>
+      </div>
+      <div class="big" style="margin-top:12px">${r(T.k)} <span>of${S.target} kcal</span></div>
+      <div class="bar"><i style="width:\${Math.min(100, T.k / S
