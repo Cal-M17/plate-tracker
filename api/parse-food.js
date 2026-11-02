@@ -1,5 +1,34 @@
 import { GoogleGenAI } from '@google/genai';
 
+async function searchOpenFoodFacts(query) {
+    try {
+        const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(query)}&search_tag=categories&countries=United+Kingdom&json=true&page_size=1`;
+        const res = await fetch(url, { headers: { 'User-Agent': 'PlateTrackerApp - UK Personal Calorie Tracker' } });
+        const data = await res.json();
+        
+        if (data.products && data.products.length > 0) {
+            const p = data.products[0];
+            const nut = p.nutriments || {};
+            
+            return {
+                name: p.product_name_en || p.product_name || query,
+                k: nut['energy-kcal_100g'] || nut['energy-kcal_value'] || 0,
+                p: nut['proteins_100g'] || 0,
+                c: nut['carbohydrates_100g'] || 0,
+                f: nut['fat_100g'] || 0,
+                fi: nut['fiber_100g'] || null,
+                su: nut['sugars_100g'] || null,
+                sa: nut['saturated-fat_100g'] || null,
+                sl: nut['salt_100g'] || null,
+                sg: 100
+            };
+        }
+    } catch (err) {
+        console.error("Open Food Facts fetch error:", err);
+    }
+    return null;
+}
+
 export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
@@ -8,20 +37,22 @@ export default async function handler(req, res) {
 
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-    const prompt = `You are an expert calorie and nutrition tracking AI assistant.
-    Here is the user's available food database and recipes list: ${JSON.stringify(availableFoods)}
-    The user states in natural language: "${message}"
+    const prompt = `You are a witty, supportive, no-nonsense British nutrition coach and calorie tracker assistant. You have plenty of personality—encouraging, sharp, and slightly cheeky when appropriate.
     
-    Task:
-    1. Identify the meal category if mentioned (Breakfast, Lunch, Dinner, Snacks). Default to Snacks if ambiguous.
-    2. Match items mentioned by the user to the closest items in the available database list.
-    3. Estimate or extract the consumed quantity in grams for each item.
-    
-    Return ONLY a raw JSON response (no markdown syntax wrappers like \`\`\`json) with this exact structure:
+    User's existing database foods: ${JSON.stringify(availableFoods.map(f => ({ id: f.id, name: f.name })))}
+    User statement: "${message}"
+
+    Determine what the user wants:
+    1. If it's a general greeting or casual chat: set "is_chat": true, provide a clever, personality-driven "reply", and leave items empty.
+    2. If it's food logging: set "is_chat": false, determine the meal category (Breakfast, Lunch, Dinner, Snacks), extract food items and grams, match local database IDs or provide an Open Food Facts "search_query". Also provide a fun, characteristic conversational "reply" summarizing what you found and asking for confirmation.
+
+    Return ONLY raw JSON with structure:
     {
+      "is_chat": boolean,
+      "reply": "Your witty/supportive response here",
       "meal": "Breakfast" | "Lunch" | "Dinner" | "Snacks",
       "items": [
-        { "id": "matched_food_id_from_database", "name": "Food Name", "grams": 150 }
+        { "id": "matched_id_or_null", "search_query": "Food name to query", "grams": 150 }
       ]
     }`;
 
@@ -33,9 +64,43 @@ export default async function handler(req, res) {
 
         const rawText = response.text.trim().replace(/^```json/g, '').replace(/^```/g, '').replace(/```$/g, '').trim();
         const parsed = JSON.parse(rawText);
-        return res.status(200).json(parsed);
+
+        if (parsed.is_chat) {
+            return res.status(200).json({ is_chat: true, reply: parsed.reply });
+        }
+
+        const processedItems = [];
+        for (const item of parsed.items) {
+            if (item.id) {
+                const localFood = availableFoods.find(f => f.id === item.id);
+                processedItems.push({
+                    id: item.id,
+                    name: localFood ? localFood.name : "Food item",
+                    per: localFood,
+                    grams: item.grams
+                });
+            } else if (item.search_query) {
+                const offResult = await searchOpenFoodFacts(item.search_query);
+                if (offResult) {
+                    processedItems.push({
+                        id: null,
+                        newFoodData: offResult,
+                        name: offResult.name,
+                        grams: item.grams
+                    });
+                }
+            }
+        }
+
+        return res.status(200).json({ 
+            is_chat: false, 
+            reply: parsed.reply,
+            meal: parsed.meal, 
+            items: processedItems 
+        });
+
     } catch (err) {
-        console.error("Gemini AI Parsing Error:", err);
-        return res.status(500).json({ error: 'Failed to process natural language log.' });
+        console.error("AI Handler Error:", err);
+        return res.status(500).json({ error: 'Failed to process message.' });
     }
 }
